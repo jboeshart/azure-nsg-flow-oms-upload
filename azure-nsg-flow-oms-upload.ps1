@@ -31,6 +31,7 @@ Apache 2.0 License
 
 .LINK
     https://github.com/jboeshart/azure-nsg-flow-oms-upload
+    https://blogs.msdn.microsoft.com/cloud_solution_architect/2017/04/03/uploading-azure-nsg-flow-logs-to-oms/
 #>
 
 
@@ -47,8 +48,11 @@ Param(
     [Parameter(Mandatory=$True)]
     [String] $StorageAccountName,   
 
-    [Parameter(Mandatory=$True)]
+    [Parameter(Mandatory=$True, ParameterSetName="StorageAccountKey")]
     [String] $StorageAccountKey,
+
+    [Parameter(Mandatory=$True, ParameterSetName="SasToken")]
+    [String] $SasToken,
 
     [String] $ContainerName = "insights-logs-networksecuritygroupflowevent"
 )
@@ -106,11 +110,10 @@ Function Post-OMSData($customerId, $sharedKey, $body, $logType)
 
 }
 
-# Function to parse through the flow log and upload to OMS
-Function Submit-FlowData($nsgflowlocalfile)
+# Function to parse through the flow log and upload to OMS, function accepts a standard object
+Function Submit-FlowData($nsgflowobject)
 {
     $uploadErrors = 0
-    $nsgflowobject = get-content -Raw -Path $nsgflowlocalfile | ConvertFrom-Json
     foreach ($record in $nsgflowobject.records) {
         $time = $record.time
         $resourceId = $record.resourceId
@@ -167,7 +170,12 @@ Function Submit-FlowData($nsgflowlocalfile)
 }
 
 # Loop through the storage and check the files
-$storageContext = New-AzureStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
+If ($StorageAccountKey) {
+   $storageContext = New-AzureStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
+}
+elseif ($SasToken) {
+   $storageContext = New-AzureStorageContext -StorageAccountName $StorageAccountName -SasToken $SasToken 
+}
 
 # Get all the blobs in the container.
 $blobs = Get-AzureStorageBlob -Container $ContainerName -Context $storageContext
@@ -184,14 +192,23 @@ foreach ($blob in $blobs) {
         # Check for metadata to see if it's already been uploaded to OMS
         if ($blob.ICloudBlob.Metadata.OmsLogType -ne $OmsLogType) {
             Write-Output "Processing file: $($blob.Name)"
-            # Download the file content locally, have to do this as there's currently no way to stick it straight into a variable
-            Get-AzureStorageBlobContent -Container $ContainerName -Context $storageContext -Blob $blob.Name -Force -Destination .
-            # Call function to process file and upload to OMS
-            Submit-FlowData($blob.Name)
-            # Remove the temp file
-            Remove-Item $blob.Name
+            if ($StorageAccountKey) {
+                # Download the file content locally, have to do this as there's currently no way to stick it straight into a variable with just the storage key
+                Get-AzureStorageBlobContent -Container $ContainerName -Context $storageContext -Blob $blob.Name -Force -Destination .
+                # Convert blob content from JSON to a standard object
+                $blobcontent = Get-Content -Raw -Path $blob.Name | ConvertFrom-Json
+                # Call function to process file and upload to OMS
+                Submit-FlowData($blobcontent)
+                # Remove the temp file
+                Remove-Item $blob.Name
+            }
+            elseif ($SasToken) {
+                # Download the blob content via HTTPS directly to a variable, we can do this because we have SAS token
+                $blobcontent = Invoke-RestMethod -Uri  $($blob.ICloudBlob.Uri.ToString() + $SasToken)
+                # Call function to process file and upload to OMS
+                Submit-FlowData($blobcontent)
+            }
         }
-
     }
     else {
         Write-Output "Not processing current file: $($blob.Name)"
